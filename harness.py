@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -15,6 +16,66 @@ def valid_position(lat, lon, alt):
         raise ValueError("Coordinates and altitude must be finite numbers")
     if not -90 <= lat <= 90 or not -180 <= lon <= 180 or not -1000 <= alt <= 10000:
         raise ValueError("Position outside valid latitude, longitude or altitude range")
+
+
+GLOBAL_FRAMES = (0, 3, 5, 6, 10, 11)
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 6371.0 * 2 * math.asin(math.sqrt(a))
+
+
+class Geocoder:
+    """Google Maps Geocoding API: place name/address <-> latitude/longitude."""
+    URL = 'https://maps.googleapis.com/maps/api/geocode/json'
+
+    def __init__(self, key, timeout=10):
+        self.key = key
+        self.timeout = timeout
+        self.reverse_cache = {}
+
+    def _query(self, **params):
+        if not self.key:
+            raise RuntimeError('GOOGLE_MAPS_API environment variable is not set; location names cannot be resolved')
+        try:
+            r = requests.get(self.URL, params={**params, 'key': self.key}, timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as exc:
+            # Don't pass the exception text on: it can contain the request URL, including the API key.
+            code = getattr(getattr(exc, 'response', None), 'status_code', None)
+            raise RuntimeError(f'Google geocoding request failed ({type(exc).__name__}{", HTTP %s" % code if code else ""})') from None
+        status = data.get('status')
+        if status == 'ZERO_RESULTS':
+            return []
+        if status != 'OK':
+            raise RuntimeError(f"Google geocoding failed: {status} {data.get('error_message', '')}".strip())
+        return data['results']
+
+    def forward(self, location):
+        if not isinstance(location, str) or not location.strip():
+            raise ValueError('location must be a non-empty place name or address')
+        results = self._query(address=location.strip())
+        if not results:
+            raise ValueError(f'No location found matching {location!r}')
+        if len(results) > 1:
+            options = [r.get('formatted_address') for r in results[:5]]
+            raise ValueError(f'{location!r} is ambiguous; ask the user which they mean (or for a more specific address). Candidates: {options}')
+        best = results[0]
+        loc = best['geometry']['location']
+        place = {'query': location, 'resolved_address': best.get('formatted_address'), 'latitude': loc['lat'], 'longitude': loc['lng']}
+        if best.get('partial_match'):
+            place['warning'] = 'Partial match only; confirm the resolved address with the user'
+        return place
+
+    def reverse(self, latitude, longitude):
+        key = (round(latitude, 5), round(longitude, 5))
+        if key not in self.reverse_cache:
+            results = self._query(latlng=f'{latitude},{longitude}')
+            self.reverse_cache[key] = results[0].get('formatted_address') if results else None
+        return self.reverse_cache[key]
 
 
 class Vehicle:
@@ -128,7 +189,7 @@ class Vehicle:
         item = items[seq]
         if item['command'] != mavutil.mavlink.MAV_CMD_NAV_WAYPOINT:
             raise ValueError('Selected item is not a NAV_WAYPOINT')
-        if item['frame'] not in (0, 3, 5, 6, 10, 11): raise ValueError('Waypoint is not in a supported global frame')
+        if item['frame'] not in GLOBAL_FRAMES: raise ValueError('Waypoint is not in a supported global frame')
         item.update(x=round(latitude * 1e7), y=round(longitude * 1e7), z=altitude)
         s, c = self.target
         mark = self.marker()
@@ -163,9 +224,54 @@ class Vehicle:
 def schema(name, description, properties=None, required=None):
     return {'type': 'function', 'function': {'name': name, 'description': description, 'parameters': {'type': 'object', 'properties': properties or {}, 'required': required or []}}}
 
-pos = {'latitude': {'type': 'number', 'description': 'Latitude in degrees'}, 'longitude': {'type': 'number', 'description': 'Longitude in degrees'}, 'altitude': {'type': 'number', 'description': 'Altitude in metres'}}
-TOOLS = [schema('get_status', 'Get latest vehicle telemetry, including message age and raw MAVLink units.'), schema('get_mission', 'Download current mission items. Global x/y are latitude/longitude scaled by 1e7.'), schema('set_mode', 'Set an ArduCopter flight mode.', {'mode': {'type': 'string'}}, ['mode']), schema('update_waypoint', 'Change an existing NAV_WAYPOINT position while preserving its altitude frame and other mission items.', {'seq': {'type': 'integer'}, **pos}, ['seq', *pos]), schema('guided_goto', 'Send a Guided position target; altitude is metres above home. Requires GUIDED mode.', pos, list(pos))]
-SYSTEM = 'You are a simulator flight-test assistant. Use tools for vehicle facts; never invent telemetry or command success. Raw MAVLink units and timestamps matter. Ask for missing coordinates, altitude or mode rather than guessing. For waypoint updates altitude uses the existing waypoint frame. Commands affect the simulator.'
+pos = {'latitude': {'type': 'number', 'description': 'Latitude in degrees (omit if location is given)'}, 'longitude': {'type': 'number', 'description': 'Longitude in degrees (omit if location is given)'}, 'location': {'type': 'string', 'description': "Place name or street address, exactly as the user said it, used instead of latitude/longitude"}, 'altitude': {'type': 'number', 'description': 'Altitude in metres'}}
+TOOLS = [schema('get_status', 'Get latest vehicle telemetry, including message age and raw MAVLink units.'), schema('get_mission', 'Download current mission items. Global x/y are latitude/longitude scaled by 1e7; positional items also include decimal latitude/longitude and, when available, the nearest street address.'), schema('set_mode', 'Set an ArduCopter flight mode.', {'mode': {'type': 'string'}}, ['mode']), schema('update_waypoint', 'Change an existing NAV_WAYPOINT position while preserving its altitude frame and other mission items. Give either latitude+longitude or location.', {'seq': {'type': 'integer'}, **pos}, ['seq', 'altitude']), schema('guided_goto', 'Send a Guided position target; altitude is metres above home. Requires GUIDED mode. Give either latitude+longitude or location.', pos, ['altitude'])]
+SYSTEM = ('You are a simulator flight-test assistant. Use tools for vehicle facts; never invent telemetry or command success. Raw MAVLink units and timestamps matter. '
+          'Ask for missing coordinates, altitude or mode rather than guessing. For waypoint updates altitude uses the existing waypoint frame. Commands affect the simulator. '
+          'When the user names a place or address instead of coordinates, pass their words in the location argument; never make up coordinates for a place yourself. '
+          'After a location-based command, tell the user the resolved_address and distance_from_vehicle_km the tool returned. '
+          'When describing waypoints, include their address from get_mission when one is present.')
+
+
+def build_functions(vehicle, geocoder):
+    def resolve(latitude, longitude, location):
+        if location:
+            place = geocoder.forward(location)
+            latitude, longitude = place['latitude'], place['longitude']
+        elif latitude is None or longitude is None:
+            raise ValueError('Provide either latitude and longitude, or a location (place name or address)')
+        else:
+            place = None
+        info = {'latitude': latitude, 'longitude': longitude}
+        if place:
+            info['resolved_address'] = place['resolved_address']
+            if 'warning' in place: info['warning'] = place['warning']
+        gpi = vehicle.status()['messages'].get('GLOBAL_POSITION_INT')
+        if gpi:
+            info['distance_from_vehicle_km'] = round(distance_km(gpi['fields']['lat'] / 1e7, gpi['fields']['lon'] / 1e7, latitude, longitude), 3)
+        return latitude, longitude, info
+
+    def get_mission():
+        items = vehicle.mission()
+        for item in items:
+            if item['frame'] in GLOBAL_FRAMES and (item['x'] or item['y']):
+                item['latitude'], item['longitude'] = item['x'] / 1e7, item['y'] / 1e7
+                if geocoder.key:
+                    try:
+                        item['address'] = geocoder.reverse(item['latitude'], item['longitude'])
+                    except Exception as exc:
+                        item['address_error'] = str(exc)
+        return items
+
+    def update_waypoint(seq, altitude, latitude=None, longitude=None, location=None):
+        latitude, longitude, info = resolve(latitude, longitude, location)
+        return {**vehicle.update_waypoint(seq, latitude, longitude, altitude), **info}
+
+    def guided_goto(altitude, latitude=None, longitude=None, location=None):
+        latitude, longitude, info = resolve(latitude, longitude, location)
+        return {**vehicle.goto(latitude, longitude, altitude), **info}
+
+    return {'get_status': vehicle.status, 'get_mission': get_mission, 'set_mode': vehicle.mode, 'update_waypoint': update_waypoint, 'guided_goto': guided_goto}
 
 
 def main():
@@ -176,8 +282,11 @@ def main():
     parser.add_argument('--log', default='runs.jsonl')
     args = parser.parse_args()
     vehicle = Vehicle(args.connect)
-    functions = {'get_status': vehicle.status, 'get_mission': vehicle.mission, 'set_mode': vehicle.mode, 'update_waypoint': vehicle.update_waypoint, 'guided_goto': vehicle.goto}
+    geocoder = Geocoder(os.environ.get('GOOGLE_MAPS_API'))
+    functions = build_functions(vehicle, geocoder)
     print('Connected to system %s component %s. Enter a question, or /quit.' % vehicle.target)
+    if not geocoder.key:
+        print('Note: GOOGLE_MAPS_API is not set; place names and waypoint addresses are disabled.')
     history = [{'role': 'system', 'content': SYSTEM}]
     while True:
         try: prompt = input('\n> ').strip()
