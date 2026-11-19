@@ -9,6 +9,8 @@ from collections import deque
 import requests
 from pymavlink import mavutil
 
+from arrival import ArrivalAssist
+
 
 def valid_position(lat, lon, alt):
     vals = (lat, lon, alt)
@@ -87,6 +89,9 @@ class Vehicle:
         self.events = deque(maxlen=1000)
         self.serial = 0
         self.target = None
+        self.assistance = None
+        self.closed = threading.Event()
+        self.send_lock = threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
         deadline = time.monotonic() + timeout
         with self.cv:
@@ -97,8 +102,11 @@ class Vehicle:
                 self.cv.wait(remaining)
 
     def _read(self):
-        while True:
-            msg = self.link.recv_match(blocking=True, timeout=1)
+        while not self.closed.is_set():
+            try:
+                msg = self.link.recv_match(blocking=True, timeout=1)
+            except (OSError, ValueError):
+                return  # Cached telemetry will age out if the connection is lost.
             if msg is None or msg.get_type() == 'BAD_DATA':
                 continue
             with self.cv:
@@ -109,6 +117,19 @@ class Vehicle:
                     self.messages[msg.get_type()] = (time.monotonic(), msg)
                     self.events.append((self.serial, msg))
                     self.cv.notify_all()
+
+    def close(self):
+        self.closed.set()
+        self.link.close()
+
+    def control_send(self, function, *arguments, **context):
+        if self.assistance:
+            return self.assistance.send(self.send, function, *arguments, **context)
+        return self.send(function, *arguments)
+
+    def send(self, function, *arguments):
+        with self.send_lock:
+            return function(*arguments)
 
     def marker(self):
         with self.cv:
@@ -149,15 +170,19 @@ class Vehicle:
         if mode not in modes:
             raise ValueError('Unknown Copter mode: ' + mode)
         mark = self.marker()
-        self.link.mav.set_mode_send(self.target[0], mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, modes[mode])
-        _, hb = self.wait(['HEARTBEAT'], mark, lambda m: m.custom_mode == modes[mode])
+        self.control_send(self.link.mav.set_mode_send, self.target[0], mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, modes[mode], mode=mode)
+        try:
+            _, hb = self.wait(['HEARTBEAT'], mark, lambda m: m.custom_mode == modes[mode])
+        except Exception:
+            if self.assistance: self.assistance.mode_failed()
+            raise
         return {'mode': mavutil.mode_string_v10(hb), 'confirmed_by': 'HEARTBEAT'}
 
     def mission(self):
         s, c = self.target
         for attempt in range(3):
             mark = self.marker()
-            self.link.mav.mission_request_list_send(s, c)
+            self.send(self.link.mav.mission_request_list_send, s, c)
             try:
                 mark, count = self.wait(['MISSION_COUNT'], mark)
                 break
@@ -167,7 +192,7 @@ class Vehicle:
         for seq in range(count.count):
             for attempt in range(3):
                 mark = self.marker()
-                self.link.mav.mission_request_int_send(s, c, seq)
+                self.send(self.link.mav.mission_request_int_send, s, c, seq)
                 try:
                     mark, item = self.wait(['MISSION_ITEM_INT', 'MISSION_ITEM'], mark, lambda m: m.seq == seq)
                     break
@@ -178,7 +203,7 @@ class Vehicle:
                 d['x'], d['y'] = round(d['x'] * 1e7), round(d['y'] * 1e7)
             d.pop('mavpackettype', None)
             items.append(d)
-        self.link.mav.mission_ack_send(s, c, mavutil.mavlink.MAV_MISSION_ACCEPTED)
+        self.send(self.link.mav.mission_ack_send, s, c, mavutil.mavlink.MAV_MISSION_ACCEPTED)
         return items
 
     def update_waypoint(self, seq, latitude, longitude, altitude):
@@ -193,7 +218,7 @@ class Vehicle:
         item.update(x=round(latitude * 1e7), y=round(longitude * 1e7), z=altitude)
         s, c = self.target
         mark = self.marker()
-        self.link.mav.mission_count_send(s, c, len(items))
+        self.control_send(self.link.mav.mission_count_send, s, c, len(items))
         sent = set()
         for _ in range(len(items) * 4 + 4):
             try:
@@ -207,7 +232,10 @@ class Vehicle:
             i = msg.seq
             if i >= len(items): raise RuntimeError('Vehicle requested invalid mission sequence')
             d = items[i]
-            self.link.mav.mission_item_int_send(s, c, i, d['frame'], d['command'], d['current'], d['autocontinue'], d['param1'], d['param2'], d['param3'], d['param4'], d['x'], d['y'], d['z'])
+            try:
+                self.control_send(self.link.mav.mission_item_int_send, s, c, i, d['frame'], d['command'], d['current'], d['autocontinue'], d['param1'], d['param2'], d['param3'], d['param4'], d['x'], d['y'], d['z'])
+            except RuntimeError as exc:
+                raise RuntimeError('Mission upload interrupted; verify the mission in Mission Planner before continuing') from exc
             sent.add(i)
         raise RuntimeError('Too many mission requests; verify vehicle mission')
 
@@ -217,7 +245,8 @@ class Vehicle:
         if status.get('mode') != 'GUIDED' or status['messages']['HEARTBEAT']['age_seconds'] > 3:
             raise ValueError('A fresh GUIDED mode heartbeat is required before goto')
         s, c = self.target
-        self.link.mav.set_position_target_global_int_send(0, s, c, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 0x0DF8, round(latitude * 1e7), round(longitude * 1e7), altitude, 0, 0, 0, 0, 0, 0, 0, 0)
+        self.control_send(self.link.mav.set_position_target_global_int_send, 0, s, c, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 0x0DF8, round(latitude * 1e7), round(longitude * 1e7), altitude, 0, 0, 0, 0, 0, 0, 0, 0,
+                          destination={'latitude': latitude, 'longitude': longitude, 'altitude': altitude})
         return {'result': 'sent (no MAVLink acknowledgement)', 'altitude_reference': 'metres above home'}
 
 
@@ -234,6 +263,12 @@ SYSTEM = ('You are a simulator flight-test assistant. Use tools for vehicle fact
 
 
 def build_functions(vehicle, geocoder):
+    def get_status():
+        result = vehicle.status()
+        if vehicle.assistance:
+            result['arrival_assistance'] = vehicle.assistance.snapshot()
+        return result
+
     def resolve(latitude, longitude, location):
         if location:
             place = geocoder.forward(location)
@@ -271,7 +306,70 @@ def build_functions(vehicle, geocoder):
         latitude, longitude, info = resolve(latitude, longitude, location)
         return {**vehicle.goto(latitude, longitude, altitude), **info}
 
-    return {'get_status': vehicle.status, 'get_mission': get_mission, 'set_mode': vehicle.mode, 'update_waypoint': update_waypoint, 'guided_goto': guided_goto}
+    return {'get_status': get_status, 'get_mission': get_mission, 'set_mode': vehicle.mode, 'update_waypoint': update_waypoint, 'guided_goto': guided_goto}
+
+
+def run_turn(prompt, args, functions, history, log, assistance=None, generation=None):
+    def check_turn():
+        if assistance and not assistance.current(generation):
+            raise InterruptedError('Operator/state change superseded this turn; pending response discarded')
+
+    history.append({'role': 'user', 'content': prompt})
+    started = time.perf_counter()
+    record = {'timestamp': time.time(), 'model': args.model, 'prompt': prompt, 'tools': []}
+    try:
+        for _ in range(8):
+            check_turn()
+            call_start = time.perf_counter()
+            response = requests.post(args.ollama.rstrip('/') + '/api/chat', json={'model': args.model, 'messages': history, 'tools': TOOLS, 'stream': False}, timeout=180)
+            response.raise_for_status()
+            data = response.json()
+            record.setdefault('model_calls', []).append({'wall_seconds': round(time.perf_counter()-call_start, 3), 'total_duration_ns': data.get('total_duration'), 'eval_count': data.get('eval_count'), 'eval_duration_ns': data.get('eval_duration')})
+            check_turn()
+            msg = data['message']
+            history.append(msg)
+            calls = msg.get('tool_calls') or []
+            if not calls:
+                record['answer'] = msg.get('content', '')
+                print(record['answer'])
+                break
+            for call in calls:
+                check_turn()
+                fn = call['function']
+                name, arguments = fn['name'], fn.get('arguments', {})
+                start = time.perf_counter()
+                try:
+                    if isinstance(arguments, str): arguments = json.loads(arguments)
+                    result = assistance.call(name, arguments, generation, functions) if assistance else functions[name](**arguments)
+                except Exception as exc:
+                    result = {'error': str(exc)}
+                record['tools'].append({'name': name, 'arguments': arguments, 'result': result, 'seconds': round(time.perf_counter()-start, 3)})
+                history.append({'role': 'tool', 'tool_name': name, 'content': json.dumps(result)})
+        else:
+            record['error'] = 'Tool-call limit reached'
+            print(record['error'])
+        check_turn()
+    except InterruptedError as exc:
+        record['cancelled'] = str(exc)
+        print('[assist] ' + str(exc))
+        history[:] = [{'role': 'system', 'content': SYSTEM}]
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        record['error'] = str(exc)
+        print('Error:', exc)
+        history[:] = [{'role': 'system', 'content': SYSTEM}]
+    record['elapsed_seconds'] = round(time.perf_counter()-started, 3)
+    log(record)
+    print('[%.3fs; %d tool calls]' % (record['elapsed_seconds'], len(record['tools'])))
+
+
+def positive_metres(value):
+    try:
+        metres = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('Expected a positive, finite distance in metres')
+    if not math.isfinite(metres) or metres <= 0:
+        raise argparse.ArgumentTypeError('Expected a positive, finite distance in metres')
+    return metres
 
 
 def main():
@@ -280,57 +378,66 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--ollama', default='http://localhost:11434')
     parser.add_argument('--log', default='runs.jsonl')
+    parser.add_argument('--approach-radius', type=positive_metres, metavar='METRES',
+                        help='Enable arrival notifications and operator handoff for the latest Guided destination')
     args = parser.parse_args()
     vehicle = Vehicle(args.connect)
+    log_lock = threading.Lock()
+
+    def log(record):
+        with log_lock:
+            with open(args.log, 'a', encoding='utf-8') as f: f.write(json.dumps(record) + '\n')
+
+    assistance = None
+    if args.approach_radius is not None:
+        assistance = ArrivalAssist(vehicle, args.approach_radius, distance_km, log)
+        vehicle.assistance = assistance
+        assistance.start()
     geocoder = Geocoder(os.environ.get('GOOGLE_MAPS_API'))
     functions = build_functions(vehicle, geocoder)
     print('Connected to system %s component %s. Enter a question, or /quit.' % vehicle.target)
     if not geocoder.key:
         print('Note: GOOGLE_MAPS_API is not set; place names and waypoint addresses are disabled.')
+    if assistance:
+        print('Arrival assistance enabled. Configure video and joystick in Mission Planner. '
+              'Commands: /manual, /manual-ready, /resume, /assist, /quit. '
+              'These commands work while the model is busy; /manual is available before arrival.')
     history = [{'role': 'system', 'content': SYSTEM}]
-    while True:
-        try: prompt = input('\n> ').strip()
-        except (EOFError, KeyboardInterrupt): break
-        if prompt in ('/quit', '/exit'): break
-        if not prompt: continue
-        history.append({'role': 'user', 'content': prompt})
-        started = time.perf_counter()
-        record = {'timestamp': time.time(), 'model': args.model, 'prompt': prompt, 'tools': []}
+    busy = threading.Event()
+
+    def worker(prompt, generation):
         try:
-            for _ in range(8):
-                call_start = time.perf_counter()
-                response = requests.post(args.ollama.rstrip('/') + '/api/chat', json={'model': args.model, 'messages': history, 'tools': TOOLS, 'stream': False}, timeout=180)
-                response.raise_for_status()
-                data = response.json()
-                msg = data['message']
-                history.append(msg)
-                record.setdefault('model_calls', []).append({'wall_seconds': round(time.perf_counter()-call_start, 3), 'total_duration_ns': data.get('total_duration'), 'eval_count': data.get('eval_count'), 'eval_duration_ns': data.get('eval_duration')})
-                calls = msg.get('tool_calls') or []
-                if not calls:
-                    record['answer'] = msg.get('content', '')
-                    print(record['answer'])
-                    break
-                for call in calls:
-                    fn = call['function']
-                    name, arguments = fn['name'], fn.get('arguments', {})
-                    start = time.perf_counter()
-                    try:
-                        if isinstance(arguments, str): arguments = json.loads(arguments)
-                        result = functions[name](**arguments)
-                    except Exception as exc:
-                        result = {'error': str(exc)}
-                    record['tools'].append({'name': name, 'arguments': arguments, 'result': result, 'seconds': round(time.perf_counter()-start, 3)})
-                    history.append({'role': 'tool', 'tool_name': name, 'content': json.dumps(result)})
+            run_turn(prompt, args, functions, history, log, assistance, generation)
+        finally:
+            busy.clear()
+
+    try:
+        while True:
+            try: prompt = input('\n> ').strip()
+            except (EOFError, KeyboardInterrupt): break
+            if prompt in ('/quit', '/exit'): break
+            if not prompt: continue
+            if assistance and prompt.startswith('/'):
+                try:
+                    if prompt == '/manual': assistance.manual()
+                    elif prompt == '/manual-ready': assistance.manual_ready()
+                    elif prompt == '/resume': assistance.resume()
+                    elif prompt == '/assist': print(json.dumps(assistance.snapshot(), indent=2))
+                    else: print('Commands: /manual, /manual-ready, /resume, /assist, /quit')
+                except Exception as exc:
+                    print('[assist] Error:', exc)
+                continue
+            if assistance:
+                if busy.is_set():
+                    print('Model busy; operator commands are available. This question was not queued.')
+                    continue
+                busy.set()
+                threading.Thread(target=worker, args=(prompt, assistance.token()), daemon=True).start()
             else:
-                record['error'] = 'Tool-call limit reached'
-                print(record['error'])
-        except (requests.RequestException, ValueError, KeyError) as exc:
-            record['error'] = str(exc)
-            print('Error:', exc)
-            history = [{'role': 'system', 'content': SYSTEM}]
-        record['elapsed_seconds'] = round(time.perf_counter()-started, 3)
-        with open(args.log, 'a', encoding='utf-8') as f: f.write(json.dumps(record) + '\n')
-        print('[%.3fs; %d tool calls]' % (record['elapsed_seconds'], len(record['tools'])))
+                run_turn(prompt, args, functions, history, log)
+    finally:
+        if assistance: assistance.close()
+        vehicle.close()
 
 
 if __name__ == '__main__':
